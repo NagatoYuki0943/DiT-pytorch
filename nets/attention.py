@@ -139,8 +139,11 @@ class BasicTransformerBlock(nn.Module):
         class_labels: Optional[torch.LongTensor] = None,
     ):
         # Notice that normalization is always applied before the real computation in the following blocks.
+
+        #--------------------------------#
         # 1. Self-Attention
-        # 在Self-Attention前先施加norm
+        #   在Self-Attention前先施加norm
+        #--------------------------------#
         if self.use_ada_layer_norm:
             norm_hidden_states = self.norm1(hidden_states, timestep)
         elif self.use_ada_layer_norm_zero:
@@ -153,19 +156,25 @@ class BasicTransformerBlock(nn.Module):
 
         cross_attention_kwargs = cross_attention_kwargs if cross_attention_kwargs is not None else {}
 
-        # 然后施加Self-Attention
+        #---------------------------#
+        #   然后施加Self-Attention
+        #---------------------------#
         attn_output = self.attn1(
             norm_hidden_states,
             encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,
             attention_mask=attention_mask,
             **cross_attention_kwargs,
         )
-        # 在Self-Attention后，再次进行了特征的缩放（gate）
+        #-------------------------------------------------#
+        #   在Self-Attention后，再次进行了特征的缩放（gate）
+        #-------------------------------------------------#
         if self.use_ada_layer_norm_zero:
             attn_output = gate_msa.unsqueeze(1) * attn_output
         hidden_states = attn_output + hidden_states
 
-        # 2. Cross-Attention
+        #------------------------#
+        #   2. Cross-Attention
+        #------------------------#
         if self.attn2 is not None:
             norm_hidden_states = (
                 self.norm2(hidden_states, timestep) if self.use_ada_layer_norm else self.norm2(hidden_states)
@@ -179,14 +188,20 @@ class BasicTransformerBlock(nn.Module):
             )
             hidden_states = attn_output + hidden_states
 
-        # 3. Feed-forward
+        #---------------------#
+        #   3. Feed-forward
+        #---------------------#
         norm_hidden_states = self.norm3(hidden_states)
 
-        # 在mlp前，进行了输入特征的缩放与偏置
+        #------------------------------------#
+        #   在mlp前，进行了输入特征的缩放与偏置
+        #------------------------------------#
         if self.use_ada_layer_norm_zero:
             norm_hidden_states = norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
 
-        # 然后施加全连接层
+        #--------------------#
+        #   然后施加全连接层
+        #--------------------#
         if self._chunk_size is not None:
             # "feed_forward_chunk_size" can be used to save memory
             if norm_hidden_states.shape[self._chunk_dim] % self._chunk_size != 0:
@@ -202,7 +217,9 @@ class BasicTransformerBlock(nn.Module):
         else:
             ff_output = self.ff(norm_hidden_states)
 
-        # 在mlp后，再次进行了特征的缩放（gate）
+        #--------------------------------------#
+        #   在mlp后，再次进行了特征的缩放（gate）
+        #--------------------------------------#
         if self.use_ada_layer_norm_zero:
             ff_output = gate_mlp.unsqueeze(1) * ff_output
 
@@ -263,6 +280,15 @@ class FeedForward(nn.Module):
         return hidden_states
 
 
+#-----------#
+#    in
+#     │
+#   Linear
+#     │
+#    GELU
+#     │
+#    out
+#-----------#
 class GELU(nn.Module):
     r"""
     GELU activation function with tanh approximation support with `approximate="tanh"`.
@@ -285,6 +311,19 @@ class GELU(nn.Module):
         return hidden_states
 
 
+#--------------------#
+#        in
+#         │
+#       Linear
+#         │
+#   ┌── split ──┐
+#   │           │
+#   │          GELU
+#   │           │
+#   └──── * ────┘
+#         │
+#        out
+#--------------------#
 class GEGLU(nn.Module):
     r"""
     A variant of the gated linear unit activation function from https://arxiv.org/abs/2002.05202.

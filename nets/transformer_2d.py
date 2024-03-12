@@ -113,7 +113,7 @@ class PatchEmbed(nn.Module):
         if self.layer_norm:
             latent = self.norm(latent)
         return latent + self.pos_embed
-    
+
 @dataclass
 class Transformer2DModelOutput(BaseOutput):
     """
@@ -251,10 +251,16 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
             encoder_attention_mask = (1 - encoder_attention_mask.to(hidden_states.dtype)) * -10000.0
             encoder_attention_mask = encoder_attention_mask.unsqueeze(1)
 
-        # 1. Input
+        #-------------------------------------#
+        #   1. Input
+        #   [4, 4, 32, 32] -> [4, 256, 1152]
+        #-------------------------------------#
         hidden_states = self.pos_embed(hidden_states)
 
-        # 2. Blocks
+        #-------------------------------------#
+        #   2. Blocks
+        #   [4, 256, 1152] -> [4, 256, 1152]
+        #-------------------------------------#
         for block in self.transformer_blocks:
             hidden_states = block(
                 hidden_states,
@@ -266,20 +272,28 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
                 class_labels=class_labels,
             )
 
-        # 3. Output
+        #--------------#
+        #   3. Output
+        #--------------#
+        # [4, 256, 1152] -> [4, 1152]
         conditioning = self.transformer_blocks[0].norm1.emb(
             timestep, class_labels, hidden_dtype=hidden_states.dtype
         )
+        # [4, 1152] -> [4, 1152 * 2] -> 2 * [4, 1152]
         shift, scale = self.proj_out_1(F.silu(conditioning)).chunk(2, dim=1)
+        # [4, 256, 1152] * scale + shift = [4, 256, 1152]
         hidden_states = self.norm_out(hidden_states) * (1 + scale[:, None]) + shift[:, None]
+        # [4, 256, 1152] -> [4, 256, 32]
         hidden_states = self.proj_out_2(hidden_states)
-
-        # unpatchify
+        # unpatchify: 256 ** 0.5 = 16
         height = width = int(hidden_states.shape[1] ** 0.5)
+        # [4, 256, 32] -> [4, 16, 16, 2, 2, 8]
         hidden_states = hidden_states.reshape(
             shape=(-1, height, width, self.patch_size, self.patch_size, self.out_channels)
         )
+        # [4, 16, 16, 2, 2, 8] -> [4, 8, 16, 2, 16, 2]
         hidden_states = torch.einsum("nhwpqc->nchpwq", hidden_states)
+        # [4, 8, 16, 2, 16, 2] -> [4, 8, 32, 32]
         output = hidden_states.reshape(
             shape=(-1, self.out_channels, height * self.patch_size, width * self.patch_size)
         )

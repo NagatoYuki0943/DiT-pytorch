@@ -145,24 +145,25 @@ class DiTPipeline(DiffusionPipeline):
     ) -> Union[ImagePipelineOutput, Tuple]:
         # 生成的批次大小、隐含层的大小与隐含层通道
         batch_size = len(class_labels)
-        latent_size = self.transformer.config.sample_size
-        latent_channels = self.transformer.config.in_channels
+        latent_size = self.transformer.config.sample_size       # 32
+        latent_channels = self.transformer.config.in_channels   # 4
 
         # --------------------------------- #
         #   前处理
         # --------------------------------- #
-        # 生成latent
+        # 生成latent [2, 4, 32, 32]
         latents = randn_tensor(
             shape=(batch_size, latent_channels, latent_size, latent_size),
             generator=generator,
             device=self.device,
             dtype=self.transformer.dtype,
         )
+        # [4, 4, 32, 32] 正负提示共用相同的潜变量
         latent_model_input = torch.cat([latents] * 2) if guidance_scale > 1 else latents
 
         # 将输入的label 与 null label进行concat，null label是负向提示类。
-        class_labels = torch.tensor(class_labels, device=self.device).reshape(-1)
-        class_null = torch.tensor([1000] * batch_size, device=self.device)
+        class_labels = torch.tensor(class_labels, device=self.device).reshape(-1)   # [class_id1, class_id2...]
+        class_null = torch.tensor([1000] * batch_size, device=self.device)          # [1000, 1000...] 长度和 class_labels 一致
         class_labels_input = torch.cat([class_labels, class_null], 0) if guidance_scale > 1 else class_labels
 
         # 设置生成的步数
@@ -173,13 +174,13 @@ class DiTPipeline(DiffusionPipeline):
         # --------------------------------- #
         # 开始N步扩散的循环
         for t in self.progress_bar(self.scheduler.timesteps):
-            if guidance_scale > 1:
-                half = latent_model_input[: len(latent_model_input) // 2]
-                latent_model_input = torch.cat([half, half], dim=0)
-            latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
-            
+            if guidance_scale > 1:  # 正负提示共用相同的潜变量,取出正提示的潜变量,给负提示
+                half = latent_model_input[: len(latent_model_input) // 2] # [4, 4, 32, 32] get [2, 4, 32, 32]
+                latent_model_input = torch.cat([half, half], dim=0)       # [2, 4, 32, 32] cat [2, 4, 32, 32] = [4, 4, 32, 32]
+            latent_model_input = self.scheduler.scale_model_input(latent_model_input, t) # [4, 4, 32, 32] -> [4, 4, 32, 32]
+
             # 处理timesteps
-            timesteps = t
+            timesteps = t # t
             if not torch.is_tensor(timesteps):
                 is_mps = latent_model_input.device.type == "mps"
                 if isinstance(timesteps, float):
@@ -188,11 +189,11 @@ class DiTPipeline(DiffusionPipeline):
                     dtype = torch.int32 if is_mps else torch.int64
                 timesteps = torch.tensor([timesteps], dtype=dtype, device=latent_model_input.device)
             elif len(timesteps.shape) == 0:
-                timesteps = timesteps[None].to(latent_model_input.device)
+                timesteps = timesteps[None].to(latent_model_input.device)   # t -> [t]
             # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-            timesteps = timesteps.expand(latent_model_input.shape[0])
+            timesteps = timesteps.expand(latent_model_input.shape[0])       # [t] -> [t, t, t, t]
 
-            # 将隐含层特征、时间步和种类输入传入到transformers中
+            # 将隐含层特征、时间步和种类输入传入到transformers中    [4, 4, 32, 32],[t, t, t, t],[class_id1, class_id2...] -> [4, 8, 32, 32]
             noise_pred = self.transformer(
                 latent_model_input, timestep=timesteps, class_labels=class_labels_input
             ).sample
@@ -200,25 +201,29 @@ class DiTPipeline(DiffusionPipeline):
             # perform guidance
             if guidance_scale > 1:
                 # 在通道上做分割，取出生图部分的通道
-                eps, rest = noise_pred[:, :latent_channels], noise_pred[:, latent_channels:]
-                cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
+                eps, rest = noise_pred[:, :latent_channels], noise_pred[:, latent_channels:] # [4, 8, 32, 32] split -> [4, 4, 32, 32], [4, 4, 32, 32]
+                # [cond_pos, uncond_neg]
+                cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)                # [4, 4, 32, 32] split -> [2, 4, 32, 32], [2, 4, 32, 32]
 
-                half_eps = uncond_eps + guidance_scale * (cond_eps - uncond_eps)
-                eps = torch.cat([half_eps, half_eps], dim=0)
+                # 使用 cond_eps - uncond_eps 计算二者的距离，使用 scale 扩大二者的距离，在 uncond_eps 基础上，得到最后的隐向量。
+                # half_eps = uncond_eps + guidance_scale * (cond_eps - uncond_eps)
+                # 另一种理解的方式,类似动量
+                half_eps = guidance_scale * cond_eps + (1 - guidance_scale) * uncond_eps
 
-                noise_pred = torch.cat([eps, rest], dim=1)
+                eps = torch.cat([half_eps, half_eps], dim=0)    # [2, 4, 32, 32] cat [2, 4, 32, 32] = [4, 4, 32, 32]
+                noise_pred = torch.cat([eps, rest], dim=1)      # [4, 4, 32, 32] cat [4, 4, 32, 32] = [4, 8, 32, 32]
 
             # 对结果进行分割，取出生图部分的通道
             if self.transformer.config.out_channels // 2 == latent_channels:
-                model_output, _ = torch.split(noise_pred, latent_channels, dim=1)
+                model_output, _ = torch.split(noise_pred, latent_channels, dim=1)   # [4, 8, 32, 32] split -> [4, 4, 32, 32], [4, 4, 32, 32]
             else:
                 model_output = noise_pred
 
             # 通过采样器将这一步噪声施加到隐含层
-            latent_model_input = self.scheduler.step(model_output, t, latent_model_input).prev_sample
+            latent_model_input = self.scheduler.step(model_output, t, latent_model_input).prev_sample   # [4, 4, 32, 32] -> [4, 4, 32, 32]
 
         if guidance_scale > 1:
-            latents, _ = latent_model_input.chunk(2, dim=0)
+            latents, _ = latent_model_input.chunk(2, dim=0) # [4, 4, 32, 32] chunk -> [2, 4, 32, 32], [2, 4, 32, 32]
         else:
             latents = latent_model_input
 
@@ -227,12 +232,12 @@ class DiTPipeline(DiffusionPipeline):
         # --------------------------------- #
         # 通过vae进行解码
         latents = 1 / self.vae.config.scaling_factor * latents
-        samples = self.vae.decode(latents).sample
+        samples = self.vae.decode(latents).sample   # [2, 4, 32, 32] -> [2, 3, 256, 256]
 
         samples = (samples / 2 + 0.5).clamp(0, 1)
 
         # 转化为float32类别
-        samples = samples.cpu().permute(0, 2, 3, 1).float().numpy()
+        samples = samples.cpu().permute(0, 2, 3, 1).float().numpy()  # [2, 3, 256, 256] -> [2, 256, 256, 3]
 
         if output_type == "pil":
             samples = self.numpy_to_pil(samples)
